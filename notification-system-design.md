@@ -725,3 +725,151 @@ RETURNING notificationID;
 ```
 
 Same ownership enforcement pattern as mark-as-read. If no row is returned, the application responds with `404` or `403`.
+
+---
+
+# Stage 3
+
+## Query Analysis, Indexing Strategy & Optimised Queries
+
+---
+
+## 1. The Given Query
+
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+---
+
+## 2. Is This Query Accurate?
+
+**Functionally? Yes. Structurally? No.**
+
+The query returns the correct data: all unread notifications for student 1042, ordered oldest first. The logic is not wrong. However it has two structural problems:
+
+**`SELECT *` is always wrong in production code.**
+It fetches every column — including the `message` TEXT field which can be kilobytes per row. At 5,000,000 rows, even a filtered result of 200 unread notifications per student transfers far more data than necessary. Every column also breaks application code silently if the schema changes. Always select only the columns the consumer actually needs.
+
+**`ORDER BY createdAt ASC` is debatable for an inbox.**
+Newest-first (`DESC`) is the standard pattern for a notification inbox since users care about recent activity. Oldest-first is only correct if the intent is "read in the order they arrived". The query as written is accurate only if that intent was explicitly decided.
+
+---
+
+## 3. Why Is This Query Slow?
+
+At 5,000,000 rows, this query triggers a **full sequential scan** of the entire `notifications` table.
+
+PostgreSQL evaluates every row in the table to check whether it satisfies `studentID = 1042 AND isRead = false`. It cannot skip irrelevant rows because there is no index guiding it to the right rows. After scanning all 5,000,000 rows, it sorts the filtered result by `createdAt`.
+
+The breakdown of cost:
+
+| Phase | Operation | Cost |
+|---|---|---|
+| Filter | Full sequential scan — 5,000,000 rows read | O(n) |
+| Sort | Sort filtered result by `createdAt` | O(k log k) where k = unread count |
+| Transfer | `SELECT *` fetches all columns per row | Unnecessarily high I/O |
+
+With 50,000 students, each averaging ~100 rows in the result, the DB is doing 5,000,000 row reads to return 100 rows. This is the worst possible access pattern.
+
+---
+
+## 4. What to Change & Computation Cost After the Fix
+
+**Fix 1: Add a composite index**
+
+```sql
+CREATE INDEX idx_notifications_student_isread_created
+    ON notifications (studentID, isRead, createdAt ASC);
+```
+
+Or use the partial index from Stage 2 (only indexes unread rows, making it smaller and faster):
+
+```sql
+CREATE INDEX idx_notifications_student_unread_created
+    ON notifications (studentID, createdAt ASC)
+    WHERE isRead = FALSE;
+```
+
+**Fix 2: Replace `SELECT *` with explicit columns**
+
+```sql
+SELECT
+    notificationID,
+    title,
+    message,
+    notificationType,
+    link,
+    createdAt
+FROM notifications
+WHERE studentID = 1042
+  AND isRead = FALSE
+ORDER BY createdAt ASC;
+```
+
+**Computation cost after fix:**
+
+| Phase | Operation | Cost |
+|---|---|---|
+| Lookup | B-tree index seek on `(studentID, isRead)` | O(log n) |
+| Scan | Index range scan — only matching rows fetched | O(k) where k = unread count |
+| Sort | Already in `createdAt ASC` order from index | O(1) — no sort step needed |
+
+The query goes from scanning 5,000,000 rows to reading only the ~100 rows that actually match. On a table of this size, this is the difference between a 2–5 second query and a sub-millisecond one.
+
+---
+
+## 5. Is Adding Indexes on Every Column a Good Idea?
+
+**No. This is actively harmful advice.**
+
+Here is why:
+
+### Every index has a write cost
+
+An index is not free. PostgreSQL maintains a separate B-tree structure for every index on a table. Every `INSERT`, `UPDATE`, and `DELETE` must update **every index** on the table. At 5,000,000 rows with continuous notification writes (new notifications created for 50,000 students), indexing every column multiplies the write overhead by the number of indexes. What started as a read performance problem becomes a write performance problem.
+
+### Indexes consume significant disk space
+
+Each index on a 5,000,000-row table can consume as much disk as the table itself. Indexing 8 columns means up to 8× the storage of the raw data — for indexes the query planner will never use.
+
+### The query planner uses at most one or two indexes per query
+
+PostgreSQL's query planner selects the most selective index for a given query. Having 8 indexes does not mean 8× the performance — it means 8× the maintenance cost for roughly the same query speed.
+
+### Low-cardinality columns are especially wasteful
+
+A column like `isRead` has only two distinct values (`TRUE` / `FALSE`). A standalone index on `isRead` is nearly useless — it narrows the result to 50% of all rows, which is worse than a sequential scan at that selectivity. The query planner will ignore it.
+
+**The correct approach:** index only on columns used in `WHERE` clauses, `JOIN` conditions, and `ORDER BY` expressions of actual production queries. Composite and partial indexes are almost always better than single-column indexes on high-volume tables.
+
+---
+
+## 6. Query: Students Who Received a Placement Notification in the Last 7 Days
+
+```sql
+SELECT DISTINCT
+    s.studentID,
+    s.name,
+    s.email
+FROM notifications n
+JOIN students s ON n.studentID = s.studentID
+WHERE n.notificationType = 'Placement'
+  AND n.createdAt >= NOW() - INTERVAL '7 days';
+```
+
+**What this does:**
+- Filters the `notifications` table to only `Placement` type notifications created in the last 7 days
+- Joins to `students` to return identifying information about each student
+- `DISTINCT` ensures a student who received multiple placement notifications in the window appears only once
+
+**Index that makes this fast:**
+
+```sql
+CREATE INDEX idx_notifications_type_created
+    ON notifications (notificationType, createdAt DESC);
+```
+
+With this index, PostgreSQL performs a narrow index range scan on `notificationType = 'Placement'` and `createdAt >= NOW() - INTERVAL '7 days'` instead of scanning all 5,000,000 rows. The join to `students` then operates only on the small filtered set.
