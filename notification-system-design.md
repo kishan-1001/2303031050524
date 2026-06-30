@@ -1040,3 +1040,292 @@ No single strategy is sufficient at scale. The right architecture layers them:
 | **HTTP** | ETags on REST fallback endpoints | Reduces data transfer on non-SSE clients |
 
 SSE handles the ongoing session. Redis handles the cold-start load. Read replicas handle DB-level scale. ETags and client caching handle edge cases. Together, these reduce the per-page-load DB query problem to effectively zero under normal operating conditions.
+
+---
+
+# Stage 5
+
+## Reliable Bulk Notification - Redesigning notify_all
+
+---
+
+## 1. The Given Implementation
+
+```
+function notify_all(student_ids: array, message: string):
+    for student_id in student_ids:
+        send_email(student_id, message)   # calls Email API
+        save_to_db(student_id, message)   # DB insert
+        push_to_app(student_id, message)  # SSE push
+```
+
+---
+
+## 2. Shortcomings
+
+### Sequential synchronous processing at 50,000 scale
+
+The loop processes one student at a time. Each iteration makes three network calls in sequence, an external email API, a DB write, and an SSE push. If each operation takes 100ms, 50,000 students x 300ms per student = 15,000 seconds = over 4 hours. This is not a notification system. It is a batch job that will never complete in any acceptable window.
+
+### No partial failure handling
+
+When `send_email` fails for student 5000, the function either crashes (students 5001–50000 get nothing) or continues silently (no record of who failed). There is no retry mechanism, no dead-letter tracking, and no way to resume from the point of failure. The 200 failed students are simply lost unless someone manually investigates logs.
+
+### 50,000 individual DB inserts
+
+Each `save_to_db` call is a separate round-trip to the database. 50,000 sequential single-row inserts is orders of magnitude slower than a single bulk insert. It also holds connections open for the entire duration of the loop, starving other requests of DB connections.
+
+### Tight coupling between unrelated operations
+
+Email delivery, DB persistence, and SSE push have completely different failure modes and latency profiles. Coupling them in a single synchronous loop means a slow email API (which is common) blocks DB writes and SSE delivery for every single student. An unreliable external service takes down the entire pipeline.
+
+### No idempotency
+
+If the function crashes at student 25,000 and is re-run, the first 25,000 students receive duplicate emails. There is no mechanism to detect that a notification was already sent to a specific student.
+
+---
+
+## 3. The 200 Failed Emails. What Now?
+
+With the current implementation, the situation is:
+
+- Some students received the email, some did not. The exact split is unknown unless detailed per-student logs exist.
+- The DB may or may not have records for the failed students — it depends on whether `save_to_db` ran before or after `send_email` in the sequence. In the given code, `send_email` runs first, so a failed email means `save_to_db` never ran either. Those students have no in-app notification and no email.
+- Re-running `notify_all` on all 50,000 students sends duplicate emails to the 49,800 who already received theirs.
+- Re-running only on the 200 requires knowing exactly who they are, which requires complete logging that the current implementation does not guarantee.
+
+This is a data integrity and operational nightmare. The only safe recovery is a manual intervention — extract the list of failed student IDs from logs, verify no DB record exists for them, and re-send only to those students. Every step of this recovery is manual, error-prone, and does not scale.
+
+---
+
+## 4. Should DB Save and Email Send Happen Together?
+
+**No. They must be decoupled.**
+
+DB persistence and email delivery serve fundamentally different purposes:
+
+| Concern | DB Save | Email Send |
+|---|---|---|
+| Purpose | Source of truth for in-app notification | External side effect for student awareness |
+| Latency | Milliseconds — local network | Hundreds of ms to seconds — external API |
+| Reliability | PostgreSQL is under our control | External email provider can be down, throttle, or reject |
+| Failure consequence | Notification does not exist anywhere | Student did not receive email, but in-app notification still exists |
+| Retry safety | Idempotent with unique constraint | Must be idempotent — retrying a failed email must not duplicate |
+
+If they are coupled and the email API fails, the DB write is skipped. The student has no in-app notification and no email. The notification is lost entirely.
+
+If they are decoupled — DB write always happens first, email is a downstream async job — then a failed email means the student at minimum has the in-app notification. The email can be retried without any risk to data integrity.
+
+**Save to DB first, always. Email is a side effect that is delivered eventually.**
+
+---
+
+## 5. Redesigned Implementation
+
+### Core Principles
+
+1. **Bulk DB insert first** — all 50,000 notifications are persisted in a single transaction before any email or push is attempted. The DB is the source of truth.
+2. **Message queue for decoupling** — individual email jobs are enqueued for async processing. Workers consume jobs independently.
+3. **Automatic retry with backoff** — failed jobs are retried by the queue. After max retries, jobs move to a dead-letter queue for inspection.
+4. **Idempotency** — each job carries a unique notification ID. Re-processing a job that already succeeded is a no-op.
+5. **SSE push is fire-and-forget** — it is not retried. The student will see the notification in-app on next fetch if the SSE push was missed.
+
+### Revised Pseudocode
+
+```
+function notify_all(student_ids: array, message: string):
+    notification_records = []
+    for student_id in student_ids:
+        notification_records.append({
+            notificationID:   generate_uuid(),
+            studentID:        student_id,
+            title:            "Placement Notification",
+            message:          message,
+            notificationType: "Placement",
+            isRead:           false,
+            createdAt:        now()
+        })
+
+    bulk_insert_to_db(notification_records)
+
+    for record in notification_records:
+        enqueue_job("email_queue", {
+            notificationID: record.notificationID,
+            studentID:      record.studentID,
+            message:        record.message
+        })
+        push_to_app(record.studentID, record)
+
+
+function email_worker(job):
+    if already_sent(job.notificationID):
+        return
+
+    success = send_email(job.studentID, job.message)
+
+    if success:
+        mark_email_sent(job.notificationID)
+    else:
+        raise RetryableError("email delivery failed")
+
+
+function bulk_insert_to_db(records: array):
+    INSERT INTO notifications
+        (notificationID, studentID, title, message, notificationType, isRead, createdAt)
+    VALUES
+        (record_1), (record_2), ..., (record_50000)
+    ON CONFLICT (notificationID) DO NOTHING
+
+
+function already_sent(notificationID: string) -> bool:
+    return EXISTS (
+        SELECT 1 FROM email_delivery_log
+        WHERE notificationID = notificationID
+    )
+
+
+function mark_email_sent(notificationID: string):
+    INSERT INTO email_delivery_log (notificationID, sentAt)
+    VALUES (notificationID, now())
+```
+
+### Queue Behaviour
+
+```
+notify_all() called
+    |
+    +-- bulk_insert_to_db()          (1 DB round-trip for 50,000 rows)
+    |
+    +-- enqueue_job() x 50,000      (jobs pushed to email_queue)
+    |
+    +-- push_to_app() x 50,000      (SSE events fired, fire-and-forget)
+    |
+    +-- Returns to HR immediately   (function completes in seconds, not hours)
+
+email_queue (processed by N parallel workers):
+    |
+    +-- email_worker(job)
+            |
+            +-- Check already_sent()  -> if yes, skip (idempotent)
+            |
+            +-- send_email()
+                    |
+                    +-- Success -> mark_email_sent()
+                    |
+                    +-- Failure -> queue retries with exponential backoff
+                                    after max retries -> dead-letter queue
+```
+
+### Additional Table: email_delivery_log
+
+```sql
+CREATE TABLE email_delivery_log (
+    notificationID  UUID PRIMARY KEY REFERENCES notifications(notificationID),
+    sentAt          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+This table guarantees exactly-once email delivery. Before sending, the worker checks for an existing row. After sending successfully, it inserts a row. If the worker crashes between send and insert, the next retry will re-send — this is the one acceptable edge case, and most email providers handle deduplication at their end as well.
+
+---
+
+## 6. What Changed and Why
+
+| Original | Redesigned | Reason |
+|---|---|---|
+| 50,000 sequential iterations | 1 bulk DB insert + queue enqueue | Reduces DB round-trips from 50,000 to 1 |
+| Email blocks DB write | DB write always happens first | Decouples reliability of in-app from email delivery |
+| No retry on failure | Queue handles retry with backoff | 200 failed emails are retried automatically |
+| No idempotency | notificationID as idempotency key | Safe to retry any job without duplicate delivery |
+| Function runs for hours | Function returns in seconds | Workers process the queue asynchronously in parallel |
+| Silent partial failure | Dead-letter queue captures permanent failures | Failures are visible and actionable, not silently lost |
+
+---
+
+# Stage 6
+
+## Priority Inbox - Top N Notifications by Weight and Recency
+
+---
+
+## Approach
+
+The priority inbox must rank notifications by two factors simultaneously:
+
+- **Type weight**: Placement (highest) > Result > Event (lowest)
+- **Recency**: Newer notifications rank higher within the same type
+
+A single composite score combines both, so a very recent Event can outrank a very old Placement. The score formula is:
+
+```
+finalScore = 0.6 * typeScore + 0.4 * recencyScore
+```
+
+Where:
+- `typeScore` is normalised: Placement = 1.0, Result = 0.667, Event = 0.333
+- `recencyScore` is normalised to [0, 1] across the current notification set — 1 = newest, 0 = oldest
+
+With these weights, a recent Event (recencyScore = 1.0) scores `0.6 * 0.333 + 0.4 * 1.0 = 0.6`, which equals a very old Placement (recencyScore = 0.0) scoring `0.6 * 1.0 + 0.4 * 0.0 = 0.6`. This is the intended behaviour: recency can compensate for lower type weight, but not completely override it.
+
+---
+
+## Data Structure: Min-Heap of Size N
+
+A min-heap of fixed size N is the correct data structure for maintaining the top N notifications efficiently.
+
+**Why a min-heap and not a sorted array:**
+
+| Operation | Sorted Array | Min-Heap (size N) |
+|---|---|---|
+| Insert one notification | O(n) — find position and shift | O(log N) — push and bubble up |
+| Find top N | O(1) — already sorted | O(N log N) — heap to sorted array |
+| Memory | O(all notifications) | O(N) — only top N stored |
+
+The heap always holds exactly N elements. The root is always the lowest-scoring item in the current top N.
+
+**Insertion logic for each new notification:**
+```
+score = computeScore(notification)
+
+if heap.size < N:
+    heap.push(notification)
+else if score > heap.peek().score:
+    heap.pop()           // remove the weakest in the current top N
+    heap.push(notification)  // insert the new stronger one
+else:
+    discard              // not in top N
+```
+
+This is O(log N) per insertion, regardless of total notification volume. As new notifications stream in continuously, the heap self-maintains — no re-sorting of the full dataset required.
+
+---
+
+## Handling Continuously Arriving Notifications
+
+New notifications shift the recency distribution, which means scores of existing notifications change relative to new ones. Two strategies:
+
+**Strategy A — Periodic full recompute (used in this implementation):**
+On a fixed interval (e.g., every 30 seconds), re-fetch all notifications, recompute scores with the updated min/max timestamps, and rebuild the heap from scratch. Simple and correct. Acceptable for a polling-based fetch.
+
+**Strategy B — Incremental update via SSE:**
+When a new notification arrives over the SSE stream (designed in Stage 1), compute its score against the current known min/max timestamps, then run the heap insertion logic. The heap updates in O(log N). If the new notification redefines `maxTs` (it is the newest), scores of all existing items decrease slightly — but the relative ranking within the heap remains stable enough that a full rebuild is only needed infrequently (e.g., when score variance exceeds a threshold).
+
+---
+
+## Code
+
+Implementation is in [`stage-6/priorityInbox.js`](stage-6/priorityInbox.js).
+
+**Key functions:**
+
+- `computeScore(notification, minTs, maxTs)` — returns the composite priority score
+- `buildTopNHeap(notifications, n, minTs, maxTs)` — processes all fetched notifications through the heap in O(n log N)
+- `ingestNewNotification(heap, notification, n, minTs, maxTs)` — processes a single incoming notification in O(log N)
+- `fetchNotifications()` — fetches from the evaluation API with Bearer auth
+- `main()` — orchestrates fetch, scoring, output, and streaming demo
+
+---
+
+## Output Screenshots
+
+Screenshots of the program output are included in the `stage-6/` directory of this repository.
