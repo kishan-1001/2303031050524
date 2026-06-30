@@ -1,7 +1,8 @@
-import axios from "axios";
+const isBrowser = typeof window !== "undefined";
 
-const LOG_API = "http://4.224.186.213/evaluation-service/logs";
-const ACCESS_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJNYXBDbGFpbXMiOnsiYXVkIjoiaHR0cDovLzIwLjI0NC41Ni4xNDQvZXZhbHVhdGlvbi1zZXJ2aWNlIiwiZW1haWwiOiIyMzAzMDMxMDUwNTI0QHBhcnVsdW5pdmVyc2l0eS5hYy5pbiIsImV4cCI6MTc4MjgwOTM3MywiaWF0IjoxNzgyODA4NDczLCJpc3MiOiJBZmZvcmQgTWVkaWNhbCBUZWNobm9sb2dpZXMgUHJpdmF0ZSBMaW1pdGVkIiwianRpIjoiOGUxYWZiNmItZGM5Ny00MTIxLWJhM2EtMjFkOTlkZTJkYzk0IiwibG9jYWxlIjoiZW4tSU4iLCJuYW1lIjoia2lzaGFuIHJveSIsInN1YiI6IjY3OTgwZWYxLTBmYzAtNGZhMi1iY2FhLTdjOTJmOTZmMWQ0MCJ9LCJlbWFpbCI6IjIzMDMwMzEwNTA1MjRAcGFydWx1bml2ZXJzaXR5LmFjLmluIiwibmFtZSI6Imtpc2hhbiByb3kiLCJyb2xsTm8iOiIyMzAzMDMxMDUwNTI0IiwiYWNjZXNzQ29kZSI6ImNKcWFFQiIsImNsaWVudElEIjoiNjc5ODBlZjEtMGZjMC00ZmEyLWJjYWEtN2M5MmY5NmYxZDQwIiwiY2xpZW50U2VjcmV0IjoiSEFHZmF2Q0RNamhHQ0N2cSJ9.Rw6ysVVmgtIfY-jUFGS-jSdgAI7ttJlZTHZV_8tAxrc";
+const LOG_API = isBrowser
+  ? "/eval-api/evaluation-service/logs"
+  : "http://4.224.186.213/evaluation-service/logs";
 
 const VALID_STACKS = ["backend", "frontend"];
 const VALID_LEVELS = ["debug", "info", "warn", "error"];
@@ -11,8 +12,13 @@ const VALID_PACKAGES = {
   frontend: ["api", "component", "hook", "page", "state", "style", "auth", "config", "middleware", "utils"],
 };
 
+let activeToken = "";
+
+export function setToken(token) {
+  activeToken = token;
+}
+
 export async function Log(stack, level, packageName, message) {
-  // Validate inputs
   if (!VALID_STACKS.includes(stack)) {
     console.error(`[Log] Invalid stack: "${stack}". Must be one of: ${VALID_STACKS.join(", ")}`);
     return;
@@ -27,14 +33,18 @@ export async function Log(stack, level, packageName, message) {
   }
 
   try {
-    const response = await axios.post(
-      LOG_API,
-      { stack, level, package: packageName, message },
-      { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
-    );
+    const response = await fetch(LOG_API, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${activeToken}`,
+      },
+      body: JSON.stringify({ stack, level, package: packageName, message }),
+    });
+    const data = await response.json();
     console.log(`[Log] Sent: [${stack}/${level}/${packageName}] ${message}`);
-    return response.data;
+    return data;
   } catch (error) {
-    console.error(`[Log] Failed to send log:`, error?.response?.data || error.message);
+    console.error(`[Log] Failed to send log:`, error.message);
   }
 }

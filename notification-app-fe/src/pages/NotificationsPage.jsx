@@ -1,35 +1,55 @@
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import {
   Alert,
   Badge,
   Box,
+  Button,
   CircularProgress,
   Divider,
-  Pagination,
   Stack,
   Typography,
 } from "@mui/material";
 import NotificationsIcon from "@mui/icons-material/Notifications";
-
+import ChevronLeftIcon from "@mui/icons-material/ChevronLeft";
+import ChevronRightIcon from "@mui/icons-material/ChevronRight";
 import { NotificationCard } from "../components/NotificationCard";
 import { NotificationFilter } from "../components/NotificationFilter";
 import { useNotifications } from "../hooks/useNotifications";
+import { Log } from "../lib/logger";
+import { useEffect } from "react";
 
 export function NotificationsPage() {
-  const [filter, setFilter] = useState();
-  const [page, setPage] = useState("1");
+  const [filter, setFilter] = useState("All");
+  const [readCount, setReadCount] = useState(0);
 
-  const { notifications, totalPages, loading, error } = useNotifications();
+  const { notifications, page, hasNextPage, loading, error, goToPage } = useNotifications(
+    filter === "All" ? null : filter
+  );
 
-  const unreadCount = 2;
+  useEffect(() => {
+    Log("frontend", "info", "page", "NotificationsPage mounted");
+  }, []);
 
-  const handleFilterChange = (newFilter) => {
+  const unreadCount = notifications.filter((n) => {
+    try {
+      const ids = new Set(JSON.parse(localStorage.getItem("read_notification_ids") ?? "[]"));
+      return !ids.has(n.ID);
+    } catch {
+      return true;
+    }
+  }).length;
 
-  };
+  const handleFilterChange = useCallback((newFilter) => {
+    Log("frontend", "info", "page", `NotificationsPage filter changed to ${newFilter}`);
+    setFilter(newFilter);
+  }, []);
 
-  const handlePageChange = (_, newPage) => {
+  const handleRead = useCallback(() => {
+    setReadCount((c) => c + 1);
+  }, []);
 
-  };
+  const handlePrev = () => goToPage(page - 1);
+  const handleNext = () => goToPage(page + 1);
 
   return (
     <Box sx={{ maxWidth: 720, mx: "auto", px: 2, py: 4 }}>
@@ -38,17 +58,22 @@ export function NotificationsPage() {
           <NotificationsIcon sx={{ fontSize: 28 }} />
         </Badge>
         <Typography variant="h5" fontWeight={700}>
-          Notifications
+          All Notifications
         </Typography>
+        {unreadCount > 0 && (
+          <Typography variant="caption" color="text.secondary">
+            {unreadCount} unread
+          </Typography>
+        )}
       </Stack>
 
       <Divider sx={{ mb: 3 }} />
 
-      <Box sx={{ marginBottom: 3 }}>
+      <Box sx={{ mb: 3 }}>
         <NotificationFilter value={filter} onChange={handleFilterChange} />
       </Box>
 
-      {true && (
+      {loading && (
         <Box display="flex" justifyContent="center" py={6}>
           <CircularProgress />
         </Box>
@@ -58,27 +83,41 @@ export function NotificationsPage() {
         <Alert severity="error">Failed to load notifications: {error}</Alert>
       )}
 
-      {loading && !error && notifications.length == "0" && (
-        <Alert severity="info">Something message</Alert>
+      {!loading && !error && notifications.length === 0 && (
+        <Alert severity="info">No notifications found.</Alert>
       )}
 
-      {loading && !error && notifications.length > 0 && (
+      {!loading && !error && notifications.length > 0 && (
         <Stack spacing={1.5}>
           {notifications.map((n) => (
-            <></>
+            <NotificationCard key={n.ID} notification={n} onRead={handleRead} />
           ))}
         </Stack>
       )}
 
-      {!loading && (
-        <Box display="flex" justifyContent="center" mt={4}>
-          <Pagination
-            count={totalPages}
-            page={page}
-            onChange={handlePageChange}
-            color="primary"
-            shape="rounded"
-          />
+      {!loading && !error && (
+        <Box display="flex" justifyContent="center" alignItems="center" gap={2} mt={4}>
+          <Button
+            startIcon={<ChevronLeftIcon />}
+            disabled={page <= 1}
+            onClick={handlePrev}
+            variant="outlined"
+            size="small"
+          >
+            Prev
+          </Button>
+          <Typography variant="body2" color="text.secondary">
+            Page {page}
+          </Typography>
+          <Button
+            endIcon={<ChevronRightIcon />}
+            disabled={!hasNextPage}
+            onClick={handleNext}
+            variant="outlined"
+            size="small"
+          >
+            Next
+          </Button>
         </Box>
       )}
     </Box>

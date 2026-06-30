@@ -1,20 +1,46 @@
-import { useState, useEffect } from "react";
-import { fetchNotifications } from "../apis/notifications";
+import { useState, useEffect, useCallback } from "react";
+import { fetchNotifications } from "../api/notifications";
+import { Log } from "../lib/logger";
 
-export function useNotifications() {
+const LIMIT = 8;
+
+export function useNotifications(filter) {
   const [notifications, setNotifications] = useState([]);
-  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const [hasNextPage, setHasNextPage] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const load = useCallback(async (currentPage, currentFilter) => {
+    setLoading(true);
+    setError(null);
+    Log("frontend", "info", "hook", `useNotifications load page=${currentPage} filter=${currentFilter ?? "all"}`);
+
+    try {
+      const data = await fetchNotifications({
+        page: currentPage,
+        limit: LIMIT,
+        notificationType: currentFilter,
+      });
+      setNotifications(data);
+      setHasNextPage(data.length === LIMIT);
+    } catch (err) {
+      setError(err.message);
+      Log("frontend", "error", "hook", `useNotifications error: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
-    const load = async () => {
-      const data = await fetchNotifications();
-      setNotifications(data.notifications ?? []);
-    };
+    setPage(1);
+    load(1, filter);
+  }, [filter, load]);
 
-    load();
-  }, [notifications]);
+  const goToPage = useCallback((newPage) => {
+    setPage(newPage);
+    load(newPage, filter);
+  }, [filter, load]);
 
-  const totalPages = 0;
-
-  return { notifications, total, totalPages, loading: false, error: true };
+  return { notifications, page, hasNextPage, loading, error, goToPage };
 }
