@@ -873,3 +873,170 @@ CREATE INDEX idx_notifications_type_created
 ```
 
 With this index, PostgreSQL performs a narrow index range scan on `notificationType = 'Placement'` and `createdAt >= NOW() - INTERVAL '7 days'` instead of scanning all 5,000,000 rows. The join to `students` then operates only on the small filtered set.
+
+---
+
+# Stage 4
+
+## Eliminating Per-Page-Load DB Queries for Notifications
+
+---
+
+## The Problem
+
+On every page load, the frontend calls `GET /api/notifications` for the authenticated student. With 50,000 students hitting this endpoint simultaneously, the database receives 50,000 read queries in a short window — many returning identical data to what was returned seconds ago. No data has changed, but the DB bears the full cost regardless. This is a polling-under-the-hood problem dressed as an API call.
+
+---
+
+## Strategy 1: Server-Side Caching with Redis
+
+Cache each student's notification list in Redis immediately after the first DB fetch. Subsequent requests within the TTL are served entirely from memory — the database is never touched.
+
+**Flow:**
+
+```
+Request arrives
+    |
+    +- Cache HIT  -> Return cached response (no DB query)
+    |
+    +- Cache MISS -> Query DB -> Store in Redis with TTL -> Return response
+```
+
+**Cache key structure:**
+```
+notifications:<studentID>:page:<page>:isRead:<filter>
+```
+
+**Invalidation on every write path:**
+```
+POST /api/notifications        -> DEL notifications:<studentID>:*
+PATCH .../read                 -> DEL notifications:<studentID>:*
+PATCH .../read-all             -> DEL notifications:<studentID>:*
+DELETE /api/notifications/:id  -> DEL notifications:<studentID>:*
+```
+
+**Tradeoffs:**
+
+| Benefit | Cost |
+|---|---|
+| Near-zero DB load on cache hits — O(1) memory lookup | Cache invalidation is the hard part — a missed invalidation serves stale data |
+| Response time drops from 50–200ms (DB) to <1ms (Redis) | Memory cost — 50,000 students x average cached payload = significant RAM |
+| Scales horizontally — all API instances share one Redis | TTL choice is a constant tradeoff: short TTL = more DB hits, long TTL = stale data |
+| Unread count is already a separate Redis counter (Stage 2) | Every write path must be cache-aware — tight coupling between writes and cache |
+
+**When this breaks down:** If invalidation logic is incomplete (e.g. a background job creates notifications without clearing cache), students see stale data until the TTL expires.
+
+---
+
+## Strategy 2: HTTP Caching with ETags
+
+Push caching to the HTTP layer. The server computes a hash (ETag) of the response and sends it with the response. On subsequent requests, the client sends the ETag back. If nothing has changed, the server returns `304 Not Modified` with an empty body — zero data transferred, minimal processing.
+
+**Flow:**
+
+```
+First request:
+GET /api/notifications
+<- 200 OK
+   ETag: "a3f9c2d..."
+   Cache-Control: no-cache
+   [full response body]
+
+Subsequent requests:
+GET /api/notifications
+   If-None-Match: "a3f9c2d..."
+<- 304 Not Modified
+   [empty body]
+```
+
+ETag is derived from a single cheap DB query — e.g. MAX(createdAt) or row count for the student — not a full fetch.
+
+**Tradeoffs:**
+
+| Benefit | Cost |
+|---|---|
+| Browser handles caching automatically — no extra infrastructure | Server still receives every request — connection overhead remains |
+| Works across devices if ETag is stored server-side per student | ETag computation still requires a DB query — lightweight but not zero |
+| No stale data risk — validation happens on every request | Does not help if the client disables HTTP caching |
+| No additional services required | Consistent ETag generation must be maintained across all write paths |
+
+**When this breaks down:** ETags reduce bandwidth and serialisation cost but do not reduce connection overhead. At 50,000 concurrent students, the server still handles 50,000 HTTP connections per page load.
+
+---
+
+## Strategy 3: Replace Polling with SSE (Already Designed in Stage 1)
+
+The root cause is that the frontend fetches on every page load because it has no way to know if data changed. SSE solves this at the architecture level: the client fetches once on login, then receives push events. There is nothing to poll.
+
+**Flow:**
+
+```
+Student logs in
+    |
+    +- GET /api/notifications          (fetch initial list — once)
+    |
+    +- GET /api/notifications/stream   (SSE connection — open for session)
+            |
+            +- Server pushes new notification  -> client appends to list
+            +- Server pushes read confirmation -> client updates isRead flag
+            +- Server pushes delete event      -> client removes item
+```
+
+The frontend never calls `GET /api/notifications` on page navigation again. State lives in memory, kept current by the stream.
+
+**Tradeoffs:**
+
+| Benefit | Cost |
+|---|---|
+| Eliminates per-page-load DB queries entirely — the problem is solved, not mitigated | 50,000 persistent TCP connections is a significant server resource demand |
+| Data is always fresh — no TTL, no staleness, no invalidation logic | Every write must publish events (new notification, read, delete) |
+| Reduces total HTTP requests from N per session to 1 per session | Load balancers must support long-lived HTTP connections — disable request timeouts |
+| Pairs with Redis Pub/Sub (Stage 2) to work across multiple server instances | Mobile clients on poor networks drop connections frequently — reconnect must reconcile state |
+
+**When this breaks down:** On reconnect the client must re-fetch the current list to catch events missed during disconnection. If reconnects are frequent, this can increase DB load compared to a simple poll.
+
+---
+
+## Strategy 4: Client-Side Stale-While-Revalidate
+
+The frontend caches the notification list in memory (or localStorage). On page load, it renders cached data immediately and fires a background fetch. If the fetch returns new data, the UI updates silently. If not, the cache stays.
+
+**Flow:**
+
+```
+Page load
+    |
+    +- Render cached notifications instantly (0ms perceived latency)
+    |
+    +- Background: GET /api/notifications
+            |
+            +- Response differs -> update UI
+            +- Response same   -> discard
+```
+
+**Tradeoffs:**
+
+| Benefit | Cost |
+|---|---|
+| Immediate UI render — zero perceived loading time for returning students | Background fetch still hits the DB — server load problem is not solved |
+| No backend changes required — pure frontend implementation | Cache is per-device — no cross-device sync |
+| Pairs well with ETags — background fetch uses If-None-Match, returns 304 if unchanged | State management complexity increases — UI must handle cache-to-fresh transitions |
+| Eliminates loading spinners entirely for returning students | localStorage quotas may be exceeded for large notification histories |
+
+**When this breaks down:** This improves perceived performance but does not reduce DB load at scale. Best used in combination with a server-side strategy, not as a standalone fix.
+
+---
+
+## Recommended Combined Approach
+
+No single strategy is sufficient at scale. The right architecture layers them:
+
+| Layer | Strategy | What It Solves |
+|---|---|---|
+| **Architecture** | SSE replaces page-load polling | Eliminates per-navigation DB queries entirely |
+| **Server cache** | Redis caches initial notification fetch on login | First load hits Redis, not DB |
+| **DB reads** | Route reads to PostgreSQL read replica | Isolates read load from write operations |
+| **Client** | Stale-while-revalidate on SSE reconnect | Instant render after reconnection |
+| **HTTP** | ETags on REST fallback endpoints | Reduces data transfer on non-SSE clients |
+
+SSE handles the ongoing session. Redis handles the cold-start load. Read replicas handle DB-level scale. ETags and client caching handle edge cases. Together, these reduce the per-page-load DB query problem to effectively zero under normal operating conditions.
