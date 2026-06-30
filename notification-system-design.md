@@ -430,3 +430,298 @@ eventSource.onerror = () => {
 | `PATCH` | `/api/notifications/read-all` | Mark all as read | ✅ |
 | `DELETE` | `/api/notifications/:notificationID` | Delete a notification | ✅ |
 | `GET` | `/api/notifications/stream` | SSE — real-time push stream | ✅ |
+
+---
+
+# Stage 2
+
+## Notification Platform — Persistent Storage, Schema & Scaling
+
+---
+
+## 1. Database Choice: PostgreSQL
+
+**PostgreSQL** is the chosen database for this notification platform.
+
+### Reasoning
+
+Notifications are structured, relational data. Each notification belongs to exactly one student, has a fixed set of fields, and its read/unread state must be consistent — if a student marks something as read, that change must never be lost or partially applied. PostgreSQL gives us:
+
+| Factor | Why PostgreSQL Wins |
+|---|---|
+| **ACID compliance** | Read/unread state changes are transactional — no partial updates |
+| **Structured schema** | Notifications have a fixed, well-known shape — a relational model fits perfectly |
+| **Indexing** | Composite indexes on `(studentID, isRead, createdAt)` make the most frequent queries fast |
+| **Aggregations** | `COUNT` queries for unread badges are efficient with proper indexing |
+| **Scalability path** | Read replicas, partitioning, and connection pooling (via PgBouncer) are mature and well-documented |
+| **JSONB support** | Optional metadata field can store arbitrary JSON without sacrificing query performance |
+
+A document database like MongoDB would introduce eventual consistency risks on the `isRead` field and lacks the native aggregation performance that PostgreSQL's query planner provides for this workload.
+
+---
+
+## 2. Database Schema
+
+### Table: `students`
+
+This table is owned by the authentication service. Defined here for reference only, as `notifications` holds a foreign key to it.
+
+```sql
+CREATE TABLE students (
+    studentID    SERIAL PRIMARY KEY,
+    email        VARCHAR(255) NOT NULL UNIQUE,
+    name         VARCHAR(255) NOT NULL,
+    createdAt    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+---
+
+### Table: `notifications`
+
+```sql
+CREATE TYPE notification_type AS ENUM ('Event', 'Result', 'Placement');
+
+CREATE TABLE notifications (
+    notificationID    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    studentID         INT NOT NULL REFERENCES students(studentID) ON DELETE CASCADE,
+    title             VARCHAR(255) NOT NULL,
+    message           TEXT NOT NULL,
+    notificationType  notification_type NOT NULL,
+    link              TEXT,
+    isRead            BOOLEAN NOT NULL DEFAULT FALSE,
+    createdAt         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+### Indexes
+
+```sql
+CREATE INDEX idx_notifications_student_created
+    ON notifications (studentID, createdAt DESC);
+
+CREATE INDEX idx_notifications_student_unread
+    ON notifications (studentID, isRead)
+    WHERE isRead = FALSE;
+```
+
+**Why these indexes:**
+- `idx_notifications_student_created` — covers the primary fetch-all query which always filters by student and sorts by date.
+- `idx_notifications_student_unread` — a partial index (only unread rows). Keeps the index small and makes unread count queries and unread-filtered fetches significantly faster as the table grows.
+
+---
+
+## 3. Scaling Problems & Solutions
+
+### Problem 1: Table Growth
+
+A platform with 50,000 students generating 10 notifications/day accumulates **182 million rows per year**. Sequential scans become unusable. Even indexed queries degrade as the index itself grows to hundreds of millions of entries.
+
+**Solution: Time-based Table Partitioning**
+
+Partition `notifications` by `createdAt` using PostgreSQL range partitioning. Each partition covers one month of data.
+
+```sql
+CREATE TABLE notifications (
+    notificationID    UUID NOT NULL DEFAULT gen_random_uuid(),
+    studentID         INT NOT NULL,
+    title             VARCHAR(255) NOT NULL,
+    message           TEXT NOT NULL,
+    notificationType  notification_type NOT NULL,
+    link              TEXT,
+    isRead            BOOLEAN NOT NULL DEFAULT FALSE,
+    createdAt         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+) PARTITION BY RANGE (createdAt);
+
+CREATE TABLE notifications_2024_06
+    PARTITION OF notifications
+    FOR VALUES FROM ('2024-06-01') TO ('2024-07-01');
+
+CREATE TABLE notifications_2024_07
+    PARTITION OF notifications
+    FOR VALUES FROM ('2024-07-01') TO ('2024-08-01');
+```
+
+Old partitions (e.g., 6+ months old) can be detached and archived to cold storage, keeping the active table small. This is operationally far simpler and faster than row-by-row deletion.
+
+---
+
+### Problem 2: Slow Pagination at High Offsets
+
+`OFFSET 10000 LIMIT 20` forces PostgreSQL to scan and discard 10,000 rows before returning 20. At scale this becomes a full index scan with O(n) cost.
+
+**Solution: Cursor-based Pagination**
+
+Instead of `OFFSET`, use the `createdAt` and `notificationID` of the last seen row as a cursor.
+
+```sql
+SELECT *
+FROM notifications
+WHERE studentID = $1
+  AND (createdAt, notificationID) < ($2, $3)
+ORDER BY createdAt DESC, notificationID DESC
+LIMIT $4;
+```
+
+The client receives the `createdAt` and `notificationID` of the last item in the response and sends them as the cursor for the next page. This is O(log n) regardless of page depth.
+
+---
+
+### Problem 3: SSE Does Not Scale Across Multiple Server Instances
+
+SSE maintains a persistent HTTP connection per student. If the backend runs across multiple instances (horizontal scaling), a notification created on instance A has no way to reach a student connected to instance B.
+
+**Solution: Redis Pub/Sub as the Message Bus**
+
+Every server instance subscribes to a Redis channel. When a notification is created, the backend publishes it to Redis. All instances receive it and push it to any connected clients they hold.
+
+```
+[API Instance A] ──creates notification──▶ [PostgreSQL]
+                                        │
+                                        └──▶ [Redis PUBLISH student:<studentID>]
+                                                    │
+                              ┌─────────────────────┘
+                              │
+                   [Redis SUBSCRIBE on all instances]
+                              │
+              [Instance B holds SSE connection for student]
+                              │
+                         ──push event──▶ [Client Browser]
+```
+
+Each instance subscribes to `student:<studentID>` channels for students currently connected to it. This decouples notification creation from delivery and works across any number of instances.
+
+---
+
+### Problem 4: Unread Count Queries Under Load
+
+`SELECT COUNT(*) WHERE isRead = FALSE` is called on every page load to render the notification badge. At high traffic this hammers the DB even with the partial index.
+
+**Solution: Maintain a Counter in Redis**
+
+Keep a Redis counter per student: `unread_count:<studentID>`. Increment on notification creation, decrement on mark-as-read. The HTTP endpoint for unread count reads from Redis in O(1) with no DB hit. Periodically reconcile with the DB as a background job to handle any drift.
+
+---
+
+## 4. SQL Queries for Stage 1 APIs
+
+---
+
+### POST `/api/notifications` — Create Notification
+
+```sql
+INSERT INTO notifications (
+    studentID,
+    title,
+    message,
+    notificationType,
+    link
+)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING
+    notificationID,
+    studentID,
+    title,
+    message,
+    notificationType,
+    link,
+    isRead,
+    createdAt;
+```
+
+---
+
+### GET `/api/notifications` — Fetch All (Paginated, cursor-based)
+
+```sql
+SELECT
+    notificationID,
+    title,
+    message,
+    notificationType,
+    link,
+    isRead,
+    createdAt
+FROM notifications
+WHERE studentID = $1
+  AND ($2::boolean IS NULL OR isRead = $2)
+  AND (
+      $3::timestamptz IS NULL
+      OR (createdAt, notificationID) < ($3, $4)
+  )
+ORDER BY createdAt DESC, notificationID DESC
+LIMIT $5;
+```
+
+Parameters: `$1` = studentID, `$2` = isRead filter (nullable), `$3` = cursor timestamp, `$4` = cursor notificationID, `$5` = limit.
+
+---
+
+### GET `/api/notifications/unread-count` — Unread Count
+
+```sql
+SELECT COUNT(*) AS unreadCount
+FROM notifications
+WHERE studentID = $1
+  AND isRead = FALSE;
+```
+
+---
+
+### GET `/api/notifications/:notificationID` — Fetch Single
+
+```sql
+SELECT
+    notificationID,
+    studentID,
+    title,
+    message,
+    notificationType,
+    link,
+    isRead,
+    createdAt
+FROM notifications
+WHERE notificationID = $1;
+```
+
+Ownership check (`studentID = authenticated studentID`) is enforced in application code after fetching.
+
+---
+
+### PATCH `/api/notifications/:notificationID/read` — Mark One as Read
+
+```sql
+UPDATE notifications
+SET isRead = TRUE
+WHERE notificationID = $1
+  AND studentID = $2
+RETURNING notificationID, isRead;
+```
+
+`$2` = authenticated student's ID. If no row is returned, the notification either does not exist or belongs to a different student — the application layer returns `404` or `403` accordingly.
+
+---
+
+### PATCH `/api/notifications/read-all` — Mark All as Read
+
+```sql
+UPDATE notifications
+SET isRead = TRUE
+WHERE studentID = $1
+  AND isRead = FALSE;
+```
+
+Returns the affected row count to report how many notifications were updated.
+
+---
+
+### DELETE `/api/notifications/:notificationID` — Delete Notification
+
+```sql
+DELETE FROM notifications
+WHERE notificationID = $1
+  AND studentID = $2
+RETURNING notificationID;
+```
+
+Same ownership enforcement pattern as mark-as-read. If no row is returned, the application responds with `404` or `403`.
